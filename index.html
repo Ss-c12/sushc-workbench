@@ -351,16 +351,15 @@
           <button class="btn ghost block" id="syncToggleBtn">☁️ 同步设置</button>
           <div id="syncPanel" hidden style="margin-top:12px;">
             <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;color:var(--text);">
-              <input type="checkbox" id="syncEnabled" /> 启用云端实时同步
+              <input type="checkbox" id="syncEnabled" /> 启用云端同步（GitHub Gist）
             </label>
             <div style="display:flex;flex-direction:column;gap:8px;">
-              <input id="syncUrl" placeholder="Supabase URL（https://xxx.supabase.co）" style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;width:100%;box-sizing:border-box;" />
-              <input id="syncKey" placeholder="anon public key" style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;width:100%;box-sizing:border-box;" />
+              <input id="syncToken" type="password" placeholder="GitHub Token（需 gist 权限）" style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;width:100%;box-sizing:border-box;" />
               <input id="syncSpace" placeholder="同步空间码（多设备填相同）" style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;width:100%;box-sizing:border-box;" />
             </div>
             <button class="btn block" id="syncSave" style="margin-top:10px;">保存并连接</button>
             <div id="syncStatus" style="font-size:12px;color:var(--muted);margin-top:8px;"></div>
-            <p style="font-size:11.5px;color:var(--muted);margin:10px 0 0;line-height:1.5;">实时同步需自建 Supabase：建表 sync_data(space,key,value,updated_at)，开启 RLS 并允许 anon 读写。数据经你自己的 Supabase 项目中转。</p>
+            <p style="font-size:11.5px;color:var(--muted);margin:10px 0 0;line-height:1.5;">同步基于你的 GitHub 秘密 Gist：数据存于私有 Gist，仅你的 Token 可读。两端填相同的「同步空间码」即可互相同步，约每 5 秒自动刷新。</p>
           </div>
         </div>
       </section>
@@ -582,52 +581,67 @@
 
   document.getElementById('viewDate').textContent = new Date().toLocaleDateString('zh-CN',{year:'numeric',month:'long',day:'numeric',weekday:'long'});
 
-  /* ---------------- 云端实时同步 (Supabase) ---------------- */
+  /* ---------------- 云端同步 (GitHub Gist) ---------------- */
   const Sync = {
-    client:null, ready:false, space:'',
-    init(){
+    enabled:false, token:'', space:'', gistId:'', version:0, timer:null, pollTimer:null,
+    async init(){
       const cfg = DB.get('sync', {});
-      if(!cfg.enabled || !cfg.url || !cfg.key || !cfg.space) return;
-      this.space = cfg.space;
-      this.loadLib(()=>{
-        try{
-          this.client = supabase.createClient(cfg.url, cfg.key);
-          this.ready = true;
-          this.pullAll();
-          this.subscribe();
-          this.status('已连接，实时同步中');
-        }catch(e){ this.status('连接失败：'+e.message); }
-      });
+      if(!cfg.enabled || !cfg.token || !cfg.space) return;
+      this.enabled=true; this.token=cfg.token; this.space=cfg.space; this.gistId=cfg.gistId||'';
+      if(!this.gistId){ await this.findGist(); }
+      await this.pullAll();
+      this.status(this.gistId ? '已连接，同步中' : '已连接（改动后将自动创建同步 Gist）');
+      this.startPoll();
     },
-    loadLib(cb){
-      if(window.supabase) return cb();
-      const s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
-      s.onload = cb;
-      s.onerror = ()=> this.status('同步库加载失败，请检查网络');
-      document.head.appendChild(s);
+    api(path, method, body){
+      const opt = { method, headers:{ 'Authorization':'Bearer '+this.token, 'Accept':'application/vnd.github+json', 'Content-Type':'application/json', 'User-Agent':'sushc-workbench' } };
+      if(body) opt.body = JSON.stringify(body);
+      return fetch('https://api.github.com'+path, opt)
+        .then(r=> r.json().then(j=>({ok:r.ok, status:r.status, data:j})))
+        .catch(e=>({ok:false, status:0, data:{message:e.message}}));
     },
-    push(k, v){
-      if(!this.ready) return;
-      const payload = { space:this.space, key:'wb_'+k, value:JSON.stringify(v), updated_at:new Date().toISOString() };
-      this.client.from('sync_data').upsert(payload, { onConflict:'space,key' }).then(()=>{}).catch(()=>{});
+    snapshot(){
+      const data = {};
+      for(let i=0;i<localStorage.length;i++){
+        const key = localStorage.key(i);
+        if(key && key.indexOf('wb_')===0 && key!=='wb_sync'){ try{ data[key.slice(3)] = JSON.parse(localStorage.getItem(key)); }catch(e){} }
+      }
+      return { v: this.version+1, data };
     },
-    pullAll(){
-      this.client.from('sync_data').select('*').eq('space', this.space).then(({data,error})=>{
-        if(error) return this.status('拉取失败：'+error.message);
-        (data||[]).forEach(r=>{ if(r.key==='wb_sync') return; try{ DB.raw(r.key.replace(/^wb_/,''), JSON.parse(r.value)); }catch(e){} });
-        rerender();
-        this.status('已同步 '+ (data?data.length:0) +' 项');
-      });
+    applySnapshot(snap){
+      if(!snap || !snap.data) return;
+      if(snap.v <= this.version) return;
+      for(const k in snap.data){ try{ DB.raw(k, snap.data[k]); }catch(e){} }
+      this.version = snap.v; rerender();
     },
-    subscribe(){
-      this.client.channel('sync-'+this.space)
-        .on('postgres_changes', {event:'*', schema:'public', table:'sync_data', filter:'space=eq.'+this.space}, (payload)=>{
-          const r = payload.new;
-          if(r && r.key && r.key!=='wb_sync'){ try{ DB.raw(r.key.replace(/^wb_/,''), JSON.parse(r.value)); rerender(); }catch(e){} }
-        })
-        .subscribe();
+    push(k, v){ if(this.enabled && !this.timer) this.timer = setTimeout(()=>this.pushAll(), 1200); },
+    async pushAll(){
+      this.timer = null;
+      if(!this.enabled) return;
+      const snap = this.snapshot(); this.version = snap.v;
+      const content = JSON.stringify(snap);
+      let res;
+      if(!this.gistId){
+        res = await this.api('/gists', 'POST', { description:'SushcWorkbench sync '+this.space, public:false, files:{ 'sushc-sync.json':{ content } } });
+        if(res.ok && res.data && res.data.id){ this.gistId = res.data.id; this.saveCfg(); }
+      } else {
+        res = await this.api('/gists/'+this.gistId, 'PATCH', { files:{ 'sushc-sync.json':{ content } } });
+      }
+      this.status(res.ok ? '已同步（v'+snap.v+'）' : '推送失败：'+(res.data&&res.data.message||res.status));
     },
+    async findGist(){
+      const res = await this.api('/gists', 'GET');
+      if(res.ok && res.data){ const f = res.data.find(g=> g.description==='SushcWorkbench sync '+this.space); if(f){ this.gistId=f.id; this.saveCfg(); } }
+    },
+    async pullAll(){
+      if(!this.gistId){ this.version=0; return; }
+      const res = await this.api('/gists/'+this.gistId, 'GET');
+      if(res.ok && res.data && res.data.files && res.data.files['sushc-sync.json']){
+        try{ this.applySnapshot(JSON.parse(res.data.files['sushc-sync.json'].content)); }catch(e){}
+      }
+    },
+    startPoll(){ if(this.pollTimer) return; this.pollTimer = setInterval(()=>{ if(this.enabled) this.pullAll(); }, 5000); },
+    saveCfg(){ const cfg = DB.get('sync', {}); cfg.gistId = this.gistId; DB.raw('sync', cfg); },
     status(msg){ const el = document.getElementById('syncStatus'); if(el) el.textContent = msg; }
   };
   /* 同步设置面板交互 */
@@ -636,16 +650,15 @@
   if(syncToggleBtn) syncToggleBtn.addEventListener('click', ()=>{ syncPanel.hidden = !syncPanel.hidden; });
   const syncCfg = DB.get('sync', {});
   if(document.getElementById('syncEnabled')) document.getElementById('syncEnabled').checked = !!syncCfg.enabled;
-  if(document.getElementById('syncUrl')) document.getElementById('syncUrl').value = syncCfg.url || '';
-  if(document.getElementById('syncKey')) document.getElementById('syncKey').value = syncCfg.key || '';
+  if(document.getElementById('syncToken')) document.getElementById('syncToken').value = syncCfg.token || '';
   if(document.getElementById('syncSpace')) document.getElementById('syncSpace').value = syncCfg.space || '';
   const syncSave = document.getElementById('syncSave');
   if(syncSave) syncSave.addEventListener('click', ()=>{
     const cfg = {
       enabled: document.getElementById('syncEnabled').checked,
-      url: document.getElementById('syncUrl').value.trim(),
-      key: document.getElementById('syncKey').value.trim(),
-      space: document.getElementById('syncSpace').value.trim()
+      token: document.getElementById('syncToken').value.trim(),
+      space: document.getElementById('syncSpace').value.trim(),
+      gistId: syncCfg.gistId || ''
     };
     DB.set('sync', cfg);
     toast('同步设置已保存，正在重连…');
