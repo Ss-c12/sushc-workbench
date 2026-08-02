@@ -367,7 +367,9 @@
               <button class="btn ghost block" id="syncTest" style="flex:1;">测试连接</button>
               <button class="btn block" id="syncSave" style="flex:1;">保存并连接</button>
             </div>
+            <button class="btn ghost block" id="syncNow" style="margin-top:8px;">🔄 立即同步（强制推送）</button>
             <div id="syncStatus" style="font-size:12px;color:var(--muted);margin-top:8px;"></div>
+            <div id="syncLastPush" style="font-size:11.5px;color:var(--muted);margin-top:4px;"></div>
             <p style="font-size:11.5px;color:var(--muted);margin:10px 0 0;line-height:1.5;">同步基于你的 GitHub 秘密 Gist：数据存于私有 Gist，仅你的 Token 可读，不公开。两端填相同的「同步空间码」即可互相同步，约每 5 秒自动刷新。Token 需在 GitHub → Settings → Tokens 勾选 <b>gist</b> 权限。</p>
           </div>
         </div>
@@ -601,7 +603,9 @@
       this.startPoll();
       this.pullAll().then(async ()=>{
         if(this._lastOk){
-          this.status('已连接，同步中'+(this._count? '（已同步 '+this._count+' 项）':'（云端暂无数据）'));
+          let msg = '已连接，同步中'+(this._count? '（已同步 '+this._count+' 项）':'（云端暂无数据）');
+          if(this._dupGists && this._dupGists.length) msg += ' ⚠️ 发现 '+this._dupGists.length+' 个重复空间';
+          this.status(msg);
           return;
         }
         // 该空间码可能还没有 Gist：先验证 Token，再自动创建
@@ -666,17 +670,44 @@
       } else {
         res = await this.api('/gists/'+this.gistId, 'PATCH', { files:{ 'sushc-sync.json':{ content } } });
       }
-      if(res.ok) this.status('已同步（v'+snap.v+'）');
-      else this.status('推送失败：'+(res.data&&res.data.message || res.status));
+      const time = new Date().toLocaleTimeString('zh-CN');
+      if(res.ok){
+        this.status('已同步（v'+snap.v+'）');
+        this._lastPush = { time, ok:true, msg:'成功 v'+snap.v };
+      } else {
+        this.status('推送失败：'+(res.data&&res.data.message || res.status));
+        this._lastPush = { time, ok:false, msg:res.data&&res.data.message || res.status };
+      }
+      this.renderLastPush();
+    },
+    renderLastPush(){
+      const el = document.getElementById('syncLastPush');
+      if(!el || !this._lastPush) return;
+      el.textContent = '上次推送：'+this._lastPush.time+' '+(this._lastPush.ok?'✅':'❌')+' '+this._lastPush.msg;
     },
     async findGist(){
       const res = await this.api('/gists', 'GET');
-      if(res.ok && res.data){ const f = res.data.find(g=> g.description==='SushcWorkbench sync '+this.space); if(f){ this.gistId=f.id; this.saveCfg(); } }
+      if(res.ok && Array.isArray(res.data)){
+        const matches = res.data
+          .filter(g=> g.description==='SushcWorkbench sync '+this.space)
+          .sort((a,b)=> new Date(b.updated_at) - new Date(a.updated_at));
+        if(matches.length){
+          this.gistId = matches[0].id; this.saveCfg();
+          this._dupGists = matches.slice(1);
+        }
+      }
     },
+    expectedDesc(){ return 'SushcWorkbench sync '+this.space; },
     async pullAll(){
       if(!this.gistId){ await this.findGist(); }
       if(!this.gistId){ this._lastOk=false; return { ok:false }; }
-      const res = await this.api('/gists/'+this.gistId, 'GET');
+      let res = await this.api('/gists/'+this.gistId, 'GET');
+      // 如果保存的 gistId 对应了别的空间码，重新按描述查找
+      if(res.ok && res.data && res.data.description !== this.expectedDesc()){
+        this.gistId = ''; this.saveCfg(); await this.findGist();
+        if(!this.gistId){ this._lastOk=false; return { ok:false }; }
+        res = await this.api('/gists/'+this.gistId, 'GET');
+      }
       this._lastOk = res.ok;
       if(res.ok && res.data && res.data.files && res.data.files['sushc-sync.json']){
         const raw = res.data.files['sushc-sync.json'].content;
@@ -698,7 +729,9 @@
   if(document.getElementById('syncSpace')) document.getElementById('syncSpace').value = syncCfg.space || '';
   const syncSave = document.getElementById('syncSave');
   const syncTest = document.getElementById('syncTest');
+  const syncNow = document.getElementById('syncNow');
   if(syncTest) syncTest.addEventListener('click', ()=> Sync.test());
+  if(syncNow) syncNow.addEventListener('click', ()=>{ Sync.status('正在强制推送…'); Sync.pushAll(); });
   if(syncSave) syncSave.addEventListener('click', ()=>{
     const token = document.getElementById('syncToken').value.trim();
     const space = document.getElementById('syncSpace').value.trim();
