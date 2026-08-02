@@ -599,9 +599,23 @@
       this.enabled=true; this.token=cfg.token; this.space=cfg.space; this.gistId=cfg.gistId||'';
       this.status('连接中…');
       this.startPoll();
-      this.pullAll().then(()=>{
-        if(this._lastOk) this.status('已连接，同步中'+(this._count? '（已同步 '+this._count+' 项）':'（云端暂无数据）'));
-        else this.status('连接失败：检查 Token 是否正确，或先点「测试连接」');
+      this.pullAll().then(async ()=>{
+        if(this._lastOk){
+          this.status('已连接，同步中'+(this._count? '（已同步 '+this._count+' 项）':'（云端暂无数据）'));
+          return;
+        }
+        // 该空间码可能还没有 Gist：先验证 Token，再自动创建
+        const test = await this.api('/gists', 'GET');
+        if(!test.ok){
+          const msg = (test.data && test.data.message) || ('HTTP '+test.status);
+          if(test.status===401) this.status('❌ 401 未授权：Token 不对或没勾选 gist 权限');
+          else this.status('❌ 连接失败：'+msg+'（请点「测试连接」查看详情）');
+          return;
+        }
+        this.status('首次使用，正在创建云端空间…');
+        await this.pushAll();
+        if(this.gistId) this.status('✅ 已连接，云端空间已创建');
+        else this.status('❌ 创建云端空间失败，请点「测试连接」排查');
       });
     },
     api(path, method, body){
@@ -689,11 +703,12 @@
     const token = document.getElementById('syncToken').value.trim();
     const space = document.getElementById('syncSpace').value.trim();
     if(!token || !space){ Sync.status('请先填完 ① Token ② 空间码'); return; }
+    const changed = token !== syncCfg.token || space !== syncCfg.space;
     const cfg = {
       enabled: document.getElementById('syncEnabled').checked,
       token: token,
       space: space,
-      gistId: syncCfg.gistId || ''
+      gistId: changed ? '' : (syncCfg.gistId || '')
     };
     DB.set('sync', cfg);
     toast('同步设置已保存，正在重连…');
