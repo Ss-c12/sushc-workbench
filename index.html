@@ -351,19 +351,15 @@
           <button class="btn ghost block" id="syncToggleBtn">☁️ 同步设置</button>
           <div id="syncPanel" hidden style="margin-top:12px;">
             <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;color:var(--text);">
-              <input type="checkbox" id="syncEnabled" /> 启用云端同步（Supabase）
+              <input type="checkbox" id="syncEnabled" /> 启用云端同步（GitHub Gist）
             </label>
             <div style="display:flex;flex-direction:column;gap:10px;">
               <div>
-                <div style="font-size:12px;color:var(--muted);margin-bottom:3px;">① 项目地址 Project URL</div>
-                <input id="syncUrl" placeholder="https://xxxx.supabase.co" style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;width:100%;box-sizing:border-box;" />
+                <div style="font-size:12px;color:var(--muted);margin-bottom:3px;">① GitHub Token（需勾选 gist 权限）</div>
+                <input id="syncToken" type="password" placeholder="ghp_..." style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;width:100%;box-sizing:border-box;" />
               </div>
               <div>
-                <div style="font-size:12px;color:var(--muted);margin-bottom:3px;">② API Key（anon，以 eyJ 开头）</div>
-                <input id="syncKey" type="password" placeholder="eyJhbGci...（Legacy anon key）" style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;width:100%;box-sizing:border-box;" />
-              </div>
-              <div>
-                <div style="font-size:12px;color:var(--muted);margin-bottom:3px;">③ 同步空间码（多设备填相同）</div>
+                <div style="font-size:12px;color:var(--muted);margin-bottom:3px;">② 同步空间码（多设备填相同）</div>
                 <input id="syncSpace" placeholder="例如 sushc2026" style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;width:100%;box-sizing:border-box;" />
               </div>
             </div>
@@ -372,7 +368,7 @@
               <button class="btn block" id="syncSave" style="flex:1;">保存并连接</button>
             </div>
             <div id="syncStatus" style="font-size:12px;color:var(--muted);margin-top:8px;"></div>
-            <p style="font-size:11.5px;color:var(--muted);margin:10px 0 0;line-height:1.5;">同步基于你的 Supabase：anon key 可长期嵌入前端、泄露风险低（靠 RLS 管控）。建表后两端填相同「同步空间码」即自动互相同步，约每 5 秒刷新。数据存于你自己的 Supabase 项目。Key 请复制「Legacy anon」标签页里 <b>eyJ…</b> 开头的那串。</p>
+            <p style="font-size:11.5px;color:var(--muted);margin:10px 0 0;line-height:1.5;">同步基于你的 GitHub 秘密 Gist：数据存于私有 Gist，仅你的 Token 可读，不公开。两端填相同的「同步空间码」即可互相同步，约每 5 秒自动刷新。Token 需在 GitHub → Settings → Tokens 勾选 <b>gist</b> 权限。</p>
           </div>
         </div>
       </section>
@@ -594,51 +590,38 @@
 
   document.getElementById('viewDate').textContent = new Date().toLocaleDateString('zh-CN',{year:'numeric',month:'long',day:'numeric',weekday:'long'});
 
-  /* ---------------- 云端同步 (Supabase REST，零依赖) ---------------- */
+  /* ---------------- 云端同步 (GitHub Gist，零依赖) ---------------- */
   const Sync = {
-    enabled:false, url:'', key:'', space:'', version:0, timer:null, pollTimer:null,
+    enabled:false, token:'', space:'', gistId:'', version:0, timer:null, pollTimer:null,
     init(){
       const cfg = DB.get('sync', {});
-      if(!cfg.enabled || !cfg.url || !cfg.key || !cfg.space) return;
-      this.enabled = true;
-      this.url = (cfg.url||'').replace(/\/+$/,'');
-      this.key = cfg.key;
-      this.space = cfg.space;
+      if(!cfg.enabled || !cfg.token || !cfg.space) return;
+      this.enabled=true; this.token=cfg.token; this.space=cfg.space; this.gistId=cfg.gistId||'';
       this.status('连接中…');
       this.startPoll();
       this.pullAll().then(()=>{
-        if(this._lastOk) this.status('已连接，同步中（已同步 '+this._count+' 项）');
-        else this.status('连接失败：检查 URL / Key 是否正确，或先点「测试连接」');
+        if(this._lastOk) this.status('已连接，同步中'+(this._count? '（已同步 '+this._count+' 项）':'（云端暂无数据）'));
+        else this.status('连接失败：检查 Token 是否正确，或先点「测试连接」');
       });
     },
-    headers(){
-      return { 'apikey': this.key, 'Authorization': 'Bearer '+this.key, 'Content-Type':'application/json' };
-    },
-    async api(method, path, body, prefer){
-      const h = this.headers();
-      if(prefer) h['Prefer'] = prefer;
-      const opt = { method, headers:h };
-      if(body !== undefined) opt.body = JSON.stringify(body);
-      try{
-        const r = await fetch(this.url+'/rest/v1/'+path, opt);
-        const j = await r.json().catch(()=>null);
-        return { ok:r.ok, status:r.status, data:j };
-      }catch(e){ return { ok:false, status:0, data:{message:e.message} }; }
+    api(path, method, body){
+      const opt = { method, headers:{ 'Authorization':'Bearer '+this.token, 'Accept':'application/vnd.github+json', 'Content-Type':'application/json', 'User-Agent':'sushc-workbench' } };
+      if(body) opt.body = JSON.stringify(body);
+      return fetch('https://api.github.com'+path, opt)
+        .then(r=> r.json().then(j=>({ok:r.ok, status:r.status, data:j})).catch(()=>({ok:r.ok, status:r.status, data:null})))
+        .catch(e=>({ok:false, status:0, data:{message:e.message}}));
     },
     async test(){
-      const url = document.getElementById('syncUrl').value.trim().replace(/\/+$/,'');
-      const key = document.getElementById('syncKey').value.trim();
+      const token = document.getElementById('syncToken').value.trim();
       const space = document.getElementById('syncSpace').value.trim();
-      if(!url || !key || !space){ this.status('请先填完 ① URL ② Key ③ 空间码'); return false; }
-      if(!/^https:\/\/.+\.supabase\.co$/.test(url)){ this.status('① URL 格式不对，应为 https://xxxx.supabase.co'); return false; }
-      if(key.indexOf('sb_publishable_')===0){ this.status('⚠️ 该 Key 是新版 Publishable key，可能不被 REST 接口接受，建议用「Legacy anon」里的 eyJ… 开头 key'); }
+      if(!token || !space){ this.status('请先填完 ① Token ② 空间码'); return false; }
+      if(token.indexOf('ghp_')!==0 && token.indexOf('github_pat_')!==0){ this.status('⚠️ Token 应以 ghp_ 或 github_pat_ 开头'); }
       this.status('测试中…');
-      this.url = url; this.key = key; this.space = space;
-      const res = await this.api('GET', 'sync_data?select=space&limit=1');
+      this.token = token; this.space = space;
+      const res = await this.api('/gists', 'GET');
       if(res.ok){ this.status('✅ 连接成功！可点「保存并连接」启用'); return true; }
       const msg = (res.data && res.data.message) || ('HTTP '+res.status);
-      if(res.status===401) this.status('❌ 401 未授权：Key 不对或不是 anon key');
-      else if(res.status===404) this.status('❌ 404：找不到 sync_data 表，请先在 Supabase 建表');
+      if(res.status===401) this.status('❌ 401 未授权：Token 不对或没勾选 gist 权限');
       else this.status('❌ 连接失败：'+msg);
       return false;
     },
@@ -646,7 +629,7 @@
       const data = {};
       for(let i=0;i<localStorage.length;i++){
         const key = localStorage.key(i);
-        if(key && key.indexOf('wb_')===0 && key!=='wb_sync' && key!=='wb_sync_cfg'){ try{ data[key.slice(3)] = JSON.parse(localStorage.getItem(key)); }catch(e){} }
+        if(key && key.indexOf('wb_')===0 && key!=='wb_sync'){ try{ data[key.slice(3)] = JSON.parse(localStorage.getItem(key)); }catch(e){} }
       }
       return { v: this.version+1, data };
     },
@@ -661,21 +644,34 @@
       this.timer = null;
       if(!this.enabled) return;
       const snap = this.snapshot(); this.version = snap.v;
-      const row = { space:this.space, key:'wb_snapshot', value: JSON.stringify(snap), updated_at:new Date().toISOString() };
-      const res = await this.api('POST', 'sync_data?on_conflict=space,key', [row], 'resolution=merge-duplicates,return=minimal');
+      const content = JSON.stringify(snap);
+      let res;
+      if(!this.gistId){
+        res = await this.api('/gists', 'POST', { description:'SushcWorkbench sync '+this.space, public:false, files:{ 'sushc-sync.json':{ content } } });
+        if(res.ok && res.data && res.data.id){ this.gistId = res.data.id; this.saveCfg(); }
+      } else {
+        res = await this.api('/gists/'+this.gistId, 'PATCH', { files:{ 'sushc-sync.json':{ content } } });
+      }
       if(res.ok) this.status('已同步（v'+snap.v+'）');
       else this.status('推送失败：'+(res.data&&res.data.message || res.status));
     },
+    async findGist(){
+      const res = await this.api('/gists', 'GET');
+      if(res.ok && res.data){ const f = res.data.find(g=> g.description==='SushcWorkbench sync '+this.space); if(f){ this.gistId=f.id; this.saveCfg(); } }
+    },
     async pullAll(){
-      const res = await this.api('GET', 'sync_data?select=*&space=eq.'+encodeURIComponent(this.space)+'&key=eq.wb_snapshot');
+      if(!this.gistId){ await this.findGist(); }
+      if(!this.gistId){ this._lastOk=false; return { ok:false }; }
+      const res = await this.api('/gists/'+this.gistId, 'GET');
       this._lastOk = res.ok;
-      if(res.ok && Array.isArray(res.data)){
-        this._count = res.data.length;
-        if(res.data[0] && res.data[0].value){ try{ this.applySnapshot(JSON.parse(res.data[0].value)); }catch(e){} }
+      if(res.ok && res.data && res.data.files && res.data.files['sushc-sync.json']){
+        const raw = res.data.files['sushc-sync.json'].content;
+        try{ const snap = JSON.parse(raw); this._count = Object.keys(snap.data||{}).length; this.applySnapshot(snap); }catch(e){}
       }
       return res;
     },
     startPoll(){ if(this.pollTimer) return; this.pollTimer = setInterval(()=>{ if(this.enabled) this.pullAll(); }, 5000); },
+    saveCfg(){ const cfg = DB.get('sync', {}); cfg.gistId = this.gistId; DB.set('sync', cfg); },
     status(msg){ const el = document.getElementById('syncStatus'); if(el) el.textContent = msg; }
   };
   /* 同步设置面板交互 */
@@ -684,23 +680,20 @@
   if(syncToggleBtn) syncToggleBtn.addEventListener('click', ()=>{ syncPanel.hidden = !syncPanel.hidden; });
   const syncCfg = DB.get('sync', {});
   if(document.getElementById('syncEnabled')) document.getElementById('syncEnabled').checked = !!syncCfg.enabled;
-  if(document.getElementById('syncUrl')) document.getElementById('syncUrl').value = syncCfg.url || '';
-  if(document.getElementById('syncKey')) document.getElementById('syncKey').value = syncCfg.key || '';
+  if(document.getElementById('syncToken')) document.getElementById('syncToken').value = syncCfg.token || '';
   if(document.getElementById('syncSpace')) document.getElementById('syncSpace').value = syncCfg.space || '';
   const syncSave = document.getElementById('syncSave');
   const syncTest = document.getElementById('syncTest');
   if(syncTest) syncTest.addEventListener('click', ()=> Sync.test());
   if(syncSave) syncSave.addEventListener('click', ()=>{
-    const url = document.getElementById('syncUrl').value.trim();
-    const key = document.getElementById('syncKey').value.trim();
+    const token = document.getElementById('syncToken').value.trim();
     const space = document.getElementById('syncSpace').value.trim();
-    if(!url || !key || !space){ Sync.status('请先填完 ① URL ② Key ③ 空间码'); return; }
-    if(!/^https:\/\/.+\.supabase\.co$/.test(url)){ Sync.status('① URL 格式不对，应为 https://xxxx.supabase.co'); return; }
+    if(!token || !space){ Sync.status('请先填完 ① Token ② 空间码'); return; }
     const cfg = {
       enabled: document.getElementById('syncEnabled').checked,
-      url: url,
-      key: key,
-      space: space
+      token: token,
+      space: space,
+      gistId: syncCfg.gistId || ''
     };
     DB.set('sync', cfg);
     toast('同步设置已保存，正在重连…');
